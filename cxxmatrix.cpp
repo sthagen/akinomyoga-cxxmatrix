@@ -9,28 +9,39 @@
 
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <time.h>
 
 #include <vector>
 #include <algorithm>
 #include <iterator>
 #include <unordered_map>
+#include <chrono>
+#include <thread>
 
 #include "cxxmatrix.hpp"
 #include "mandel.hpp"
 #include "conway.hpp"
 
+namespace cxxmatrix::config {
+  constexpr std::chrono::milliseconds frame_interval {40};
+  constexpr int default_decay = 100; // 既定の寿命
+}
+
 namespace cxxmatrix {
 
-constexpr int xmatrix_frame_interval = 20;
-constexpr int xmatrix_default_decay = 100; // 既定の寿命
-
-void xmatrix_msleep(int msec) {
-  struct timespec tv;
-  tv.tv_sec = 0;
-  tv.tv_nsec = msec * 1000000;
-  nanosleep(&tv, NULL);
-}
+struct frame_scheduler {
+  using clock_type = std::chrono::high_resolution_clock;
+  clock_type::time_point prev;
+  frame_scheduler() {
+    prev = clock_type::now();
+  }
+  void next_frame() {
+    clock_type::time_point until = prev + config::frame_interval;
+    clock_type::time_point now = clock_type::now();
+    if (until > now)
+      std::this_thread::sleep_for(until - now);
+    prev = now;
+  }
+};
 
 struct tcell_t {
   char32_t c = U' ';
@@ -49,7 +60,7 @@ struct cell_t {
   char32_t c = U' ';
   int birth = 0; // 設置時刻
   double power = 0; // 初期の明るさ
-  double decay = xmatrix_default_decay; // 寿命
+  double decay = config::default_decay; // 寿命
   std::uint32_t flags = 0;
 
   double stage = 0; // 現在の消滅段階 (0..1.0)
@@ -151,6 +162,8 @@ struct buffer {
   std::FILE* file;
 
   layer_t layers[3];
+
+  frame_scheduler scheduler;
 
 private:
   void put_utf8(char32_t uc) {
@@ -503,7 +516,7 @@ public:
         thread.age = 0;
         thread.speed = speed_table[util::rand() % std::size(speed_table)];
         thread.power = 2.0 / thread.speed;
-        thread.decay = xmatrix_default_decay;
+        thread.decay = config::default_decay;
 
         int const layer = thread.speed < 3 ? 0 : thread.speed < 5 ? 1 : 2;
         layers[layer].add_thread(thread);
@@ -519,12 +532,12 @@ public:
       layers[2].scrolly = +std::round(45 * scr);
 
       render_layers();
-      xmatrix_msleep(xmatrix_frame_interval);
+      scheduler.next_frame();
     }
-    std::uint32_t const wait = 8 * rows + 100;
+    std::uint32_t const wait = 8 * rows + config::default_decay;
     for (std::uint32_t loop = 0; loop < wait; loop++) {
       render_layers();
-      xmatrix_msleep(xmatrix_frame_interval);
+      scheduler.next_frame();
     }
   }
 
@@ -539,9 +552,9 @@ private:
           tcell.c = ' ';
         } else {
           cell.c = U'0' + util::rand() % 10;
-          cell.birth = now - std::round((0.5 + 0.1 * util::randf()) * xmatrix_default_decay);
+          cell.birth = now - std::round((0.5 + 0.1 * util::randf()) * config::default_decay);
           cell.power = 1.0;
-          cell.decay = xmatrix_default_decay;
+          cell.decay = config::default_decay;
           cell.flags = cflag_disable_bold;
           tcell.c = cell.c;
           tcell.fg = color_table[std::size(color_table) / 2 + util::rand_char() % 3];
@@ -557,12 +570,51 @@ public:
       for (int i = 0; i < 20; i++) {
         s1number_fill_numbers(stripe);
         render_direct();
-        xmatrix_msleep(xmatrix_frame_interval);
+        scheduler.next_frame();
       }
     }
   }
 
 private:
+  static void s2banner_decode(std::vector<char32_t>& msg, const char* msg_u8) {
+    while (msg.size() < s2banner_max_message_size && *msg_u8) {
+      std::uint32_t code = (byte) *msg_u8++;
+      int remain;
+      std::uint32_t min_code;
+      if (code < 0xC0) {
+        if (code >= 0x80) goto error_char;
+        remain = 0;
+        min_code = 0;
+      } else if (code < 0xE0) {
+        remain = 1;
+        min_code = 1 << 7;
+      } else if (code < 0xF0) {
+        remain = 2;
+        min_code = 1 << 11;
+      } else if (code < 0xF8) {
+        remain = 3;
+        min_code = 1 << 16;
+      } else if (code < 0xFC) {
+        remain = 4;
+        min_code = 1 << 21;
+      } else if (code < 0xFE) {
+        remain = 5;
+        min_code = 1 << 26;
+      } else {
+        goto error_char;
+      }
+
+      if (remain) code &= (1 << (6 - remain)) - 1;
+      while (remain-- && 0x80 <= (byte) *msg_u8 && (byte) *msg_u8 < 0xC0)
+        code = code << 6 | (*msg_u8++ & 0x3F);
+      if (code < min_code) goto error_char;
+      msg.push_back(code);
+      continue;
+    error_char:
+      msg.push_back(0xFFFD);
+    }
+  }
+
   struct glyph_definition_t {
     char32_t c;
     int w;
@@ -581,69 +633,119 @@ private:
       return def && (*def)(x, y);
     }
   };
-  std::vector<glyph_t> message;
-  int message_width = 0;
-  int s2banner_min_render_width = 0;
 
   static constexpr int s2banner_initial_input = 40;
   static constexpr int s2banner_cell_width = 10;
   static constexpr int s2banner_cell_height = 7;
   static constexpr std::size_t s2banner_max_message_size = 0x1000;
 
-  void s2banner_initialize(std::vector<char32_t> const& msg) {
-    static glyph_definition_t glyph_defs[] = {
+  struct banner_message_t {
+    std::vector<char32_t> text;
+    std::vector<glyph_t> glyphs;
+    int min_width = 0; // 表示に必要な最低幅
+
+    int render_width = 0; // 全体の表示幅
+    int min_progress = 0; // 最小の文字表示幅
+
+  private:
+    static glyph_definition_t const* glyph_data(char32_t c) {
+      static glyph_definition_t glyph_defs[] = {
 #include "glyph.inl"
-    };
-    static std::unordered_map<char32_t, glyph_definition_t const*> map;
-    if (map.empty()) {
-      for (auto const& def : glyph_defs)
-        map[def.c] = &def;
-    }
-
-    message.clear();
-    message_width = 0;
-    for (char32_t c: msg) {
-      if (U'a' <= c && c <= U'z')
-        c = c - U'a' + U'A';
-
+      };
+      static std::unordered_map<char32_t, glyph_definition_t const*> map;
+      if (map.empty()) {
+        for (auto const& def : glyph_defs)
+          map[def.c] = &def;
+      }
       auto it = map.find(c);
       if (it == map.end() && c != ' ')
         it = map.find(U'\uFFFD');
-
-      glyph_t g;
-      g.def = it != map.end() ? it->second : nullptr;
-      g.h = 7;
-      g.w = g.def ? g.def->w : 5;
-      g.render_width = g.w + 1;
-
-      if (message.size()) message_width++;
-      message_width += g.w;
-      message.push_back(g);
+      return it != map.end() ? it->second : nullptr;
     }
+  public:
+    void set_text(const char* msg) {
+      text.clear();
+      s2banner_decode(text, msg);
+    }
+    void resolve_glyph() {
+      glyphs.clear();
+      this->min_width = 0;
+      for (char32_t c: text) {
+        if (U'a' <= c && c <= U'z')
+          c = c - U'a' + U'A';
 
-    // Adjust rendering width
-    int rest = cols - message_width - 4;
-    while (rest > 0) {
-      int min_width = message[0].render_width;
-      int min_width_count = 0;
-      for (glyph_t const& g: message) {
-        if (g.render_width < min_width) {
-          min_width = g.render_width;
-          min_width_count = 1;
-        } else if (g.render_width == min_width) {
-          min_width_count++;
-        }
+        glyph_t g;
+        g.def = glyph_data(c);
+        g.h = 7;
+        g.w = g.def ? g.def->w : 5;
+        g.render_width = g.w + 1;
+
+        if (glyphs.size()) this->min_width++;
+        this->min_width += g.w;
+        glyphs.push_back(g);
       }
-
-      if (min_width >= s2banner_cell_width * 3 / 2) break;
-      rest -= min_width_count;
-      if (rest < 0) break;
-
-      for (glyph_t& g: message)
-        if (g.render_width == min_width) g.render_width++;
-      message_width += min_width_count;
-      s2banner_min_render_width = min_width + 1;
     }
+
+    void adjust_width(int cols) {
+      // Adjust rendering width
+      int rest = cols - this->min_width - 4;
+      this->render_width = this->min_width;
+      while (rest > 0) {
+        int min_progress = glyphs[0].render_width;
+        int min_progress_count = 0;
+        for (glyph_t const& g: glyphs) {
+          if (g.render_width < min_progress) {
+            min_progress = g.render_width;
+            min_progress_count = 1;
+          } else if (g.render_width == min_progress) {
+            min_progress_count++;
+          }
+        }
+
+        if (min_progress >= s2banner_cell_width * 3 / 2) break;
+        rest -= min_progress_count;
+        if (rest < 0) break;
+
+        for (glyph_t& g: glyphs)
+          if (g.render_width == min_progress) g.render_width++;
+        this->render_width += min_progress_count;
+        this->min_progress = min_progress;
+      }
+    }
+  };
+
+  class banner_t {
+    std::vector<banner_message_t> data;
+
+  public:
+    void add_message(std::string const& msg) {
+      banner_message_t message;
+      message.set_text(msg.c_str());
+      message.resolve_glyph();
+      data.emplace_back(std::move(message));
+    }
+    std::vector<banner_message_t>::iterator begin() { return data.begin(); }
+    std::vector<banner_message_t>::iterator end() { return data.end(); }
+
+  public:
+    int max_min_width() const {
+      int width = 0;
+      for (auto const& message: data)
+        width = std::max(width, message.min_width);
+      return width;
+    }
+    int max_number_of_characters() const {
+      std::size_t nchar = 0;
+      for (auto const& message: data)
+        nchar = std::max(nchar, message.text.size());
+      return (int) nchar;
+    }
+  };
+
+  banner_t banner;
+  void s2banner_initialize(std::vector<std::string> const& messages) {
+    for (std::string const& msg: messages)
+      banner.add_message(msg);
   }
 
   void s2banner_write_letter(int x0, int y0, glyph_t const& glyph, int type) {
@@ -657,8 +759,8 @@ private:
     }
   }
 
-  void s2banner_write_caret(int x0, int y0, bool set, int type) {
-    x0 += std::max(0, (s2banner_min_render_width - 1 - s2banner_cell_width) / 2);
+  void s2banner_write_caret(banner_message_t const& message, int x0, int y0, bool set, int type) {
+    x0 += std::max(0, (message.min_progress - 1 - s2banner_cell_width) / 2);
     for (int y = 0; y < s2banner_cell_height; y++) {
       if (y0 + y >= rows) continue;
       for (int x = 0; x < s2banner_cell_width - 1; x++) {
@@ -708,65 +810,27 @@ private:
       thread.age = 0;
       thread.speed = 8;
       thread.power = 0.5;
-      thread.decay = xmatrix_default_decay;
+      thread.decay = config::default_decay;
       layers[1].add_thread(thread);
     }
   }
 
-  static void s2banner_decode(std::vector<char32_t>& msg, const char* msg_u8) {
-    while (msg.size() < s2banner_max_message_size && *msg_u8) {
-      std::uint32_t code = (byte) *msg_u8++;
-      int remain;
-      std::uint32_t min_code;
-      if (code < 0xC0) {
-        if (code >= 0x80) goto error_char;
-        remain = 0;
-        min_code = 0;
-      } else if (code < 0xE0) {
-        remain = 1;
-        min_code = 1 << 7;
-      } else if (code < 0xF0) {
-        remain = 2;
-        min_code = 1 << 11;
-      } else if (code < 0xF8) {
-        remain = 3;
-        min_code = 1 << 16;
-      } else if (code < 0xFC) {
-        remain = 4;
-        min_code = 1 << 21;
-      } else if (code < 0xFE) {
-        remain = 5;
-        min_code = 1 << 26;
-      } else {
-        goto error_char;
-      }
-
-      if (remain) code &= (1 << (6 - remain)) - 1;
-      while (remain-- && 0x80 <= (byte) *msg_u8 && (byte) *msg_u8 < 0xC0)
-        code = code << 6 | (*msg_u8++ & 0x3F);
-      if (code < min_code) goto error_char;
-      msg.push_back(code);
-      continue;
-    error_char:
-      msg.push_back(0xFFFD);
-    }
-  }
-public:
-  void s2banner(const char* msg_u8) {
-    std::vector<char32_t> msg;
-    s2banner_decode(msg, msg_u8);
-    s2banner_initialize(msg);
-    int nchar = (int) msg.size();
-
-    int mode = 1, display_width = nchar + 1, display_height = 1;
-    if (message_width < cols) {
-      nchar = message.size();
-      display_width = message_width + s2banner_min_render_width;
-      display_height = message[0].h;
-      mode = 0;
-    } else if (nchar * 2 < cols) {
-      mode = 2;
-      display_width *= 2;
+  void s2banner_show_message(banner_message_t& message, int mode) {
+    int nchar, display_width, display_height;
+    switch (mode) {
+    default:
+    case 0:
+      message.adjust_width(cols);
+      nchar = message.glyphs.size();
+      display_width = message.render_width + message.min_progress;
+      display_height = message.glyphs[0].h;
+      break;
+    case 1:
+    case 2:
+      nchar = (int) message.text.size();
+      display_width = mode * nchar;
+      display_height = 1;
+      break;
     }
 
     // 最後に文字入力が起こった位置と時刻
@@ -794,16 +858,16 @@ public:
         switch (mode) {
         case 0:
           {
-            glyph_t const& g = message[i];
+            glyph_t const& g = message.glyphs[i];
             if (caret_moved)
-              s2banner_write_caret(x0, y0, false, type);
+              s2banner_write_caret(message, x0, y0, false, type);
             s2banner_write_letter(x0, y0, g, type);
             x0 += g.render_width;
           }
           break;
         default:
           {
-            char32_t c = msg[i];
+            char32_t c = message.text[i];
             if (U'a' <= c && c <= U'z') c = c - U'a' + U'A';
             s2banner_put_char(x0, y0, 0, 0, type, c);
           }
@@ -815,9 +879,9 @@ public:
       switch (mode) {
       case 0:
         // if (!((loop - input_time) / 25 & 1))
-        //   s2banner_write_caret(x0, y0, true);
-        s2banner_write_caret(x0, y0, !((loop - input_time) / 25 & 1), type);
-        //s2banner_write_caret(x0, y0, true);
+        //   s2banner_write_caret(message, x0, y0, true);
+        s2banner_write_caret(message, x0, y0, !((loop - input_time) / 25 & 1), type);
+        //s2banner_write_caret(message, x0, y0, true);
         break;
       default:
         s2banner_put_char(x0, y0, 0, 0, type, U'\u2589');
@@ -826,8 +890,25 @@ public:
 
       s2banner_add_thread();
       render_layers();
-      xmatrix_msleep(xmatrix_frame_interval);
+      scheduler.next_frame();
     }
+  }
+public:
+  void s2banner(std::vector<std::string> const& messages) {
+    s2banner_initialize(messages);
+
+    // mode = 0: glyph を使って表示
+    // mode = 1: 単純に文字を並べる
+    // mode = 2: 1文字ずつ空白を空けて文字を並べる
+    int mode = 1;
+    if (banner.max_min_width() < cols) {
+      mode = 0;
+    } else if (banner.max_number_of_characters() * 2 < cols) {
+      mode = 2;
+    }
+
+    for (banner_message_t& message: banner)
+      s2banner_show_message(message, mode);
   }
 
 private:
@@ -873,7 +954,7 @@ public:
       s4conway_board.step(time);
       s4conway_frame(0.5 + loop * 0.01, 0.01 * distance, std::min(0.8, 3.0 / std::sqrt(distance)));
       render_layers();
-      xmatrix_msleep(xmatrix_frame_interval);
+      scheduler.next_frame();
     }
   }
 
@@ -915,11 +996,11 @@ public:
       theta -= 0.01;
       s5mandel_frame(theta, scale, std::min(0.01 * loop, 1.0));
       render_layers();
-      xmatrix_msleep(xmatrix_frame_interval);
+      scheduler.next_frame();
     }
     for (loop = 0; loop < 100; loop++) {
       render_layers();
-      xmatrix_msleep(xmatrix_frame_interval);
+      scheduler.next_frame();
     }
 
     twinkle = default_twinkle;
@@ -961,9 +1042,12 @@ int main(int argc, char** argv) {
   buff.initialize();
   buff.term_enter();
 
-  buff.s1number();
+  std::vector<std::string> messages;
   for (int i = 1; i < argc; i++)
-    buff.s2banner(argv[i]);
+    messages.push_back(argv[i]);
+
+  buff.s1number();
+  buff.s2banner(messages);
   buff.s3rain(2800, buffer::s3rain_scroll_func_tanh);
   buff.s4conway();
   buff.s5mandel();
