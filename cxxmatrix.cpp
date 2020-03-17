@@ -9,6 +9,8 @@
 
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <termios.h>
+#include <poll.h>
 
 #include <vector>
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <thread>
+#include <functional>
 
 #include "cxxmatrix.hpp"
 #include "mandel.hpp"
@@ -155,6 +158,110 @@ public:
   }
 };
 
+typedef std::uint32_t key_t;
+
+enum key_flags {
+  key_up    = 0x110000,
+  key_down  = 0x110001,
+  key_right = 0x110002,
+  key_left  = 0x110003,
+};
+inline constexpr key_t key_ctrl(key_t k) { return k & 0x1F; }
+
+struct key_reader {
+  bool term_internal = false;
+  struct termios term_termios_save;
+  bool term_nonblock_save = false;
+
+  std::function<void(key_t)> proc;
+
+public:
+  void leave() {
+    if (!term_internal) return;
+    term_internal = false;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &this->term_termios_save);
+  }
+  void enter() {
+    if (term_internal) return;
+    term_internal = true;
+
+    tcgetattr(STDIN_FILENO, &this->term_termios_save);
+    struct termios termios = this->term_termios_save;
+    termios.c_lflag &= ~(ECHO | ICANON | IEXTEN); // シグナルは使うので ISIG は消さない
+    termios.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    termios.c_cflag &= ~(CSIZE | PARENB);
+    termios.c_cflag |= CS8;
+    termios.c_oflag &= ~(OPOST);
+    termios.c_cc[VMIN]  = 1;
+    termios.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &termios);
+  }
+
+private:
+  void process_key(key_t k) {
+    if (proc) proc(k);
+  }
+
+  bool esc = false;
+  void process_byte(byte b) {
+    if (b == 0x1b) {
+      esc = true;
+      return;
+    }
+    if (esc) {
+      if (0x40 <= b && b < 0x80) {
+        switch (b) {
+        case 'A': esc = false; process_key(key_up   ); break;
+        case 'B': esc = false; process_key(key_down ); break;
+        case 'C': esc = false; process_key(key_right); break;
+        case 'D': esc = false; process_key(key_left ); break;
+        case '[': break;
+        case 'O': break;
+        default: esc = false; break;
+        }
+      } else if (0x80 <= b) {
+        process_key(0x1b);
+        process_key(b);
+        esc = false;
+      }
+    } else {
+      process_key(b);
+    }
+  }
+  static ssize_t nonblock_read(int fd, byte* buffer, ssize_t size) {
+    struct pollfd pollfd;
+    pollfd.fd = fd;
+    pollfd.events = POLLIN | POLLERR;
+    poll(&pollfd, 1, 0);
+    if (pollfd.revents & POLLIN)
+      return read(fd, buffer, size);
+    return 0;
+  }
+public:
+  void process() {
+    byte buffer[1024];
+    ssize_t nread;
+    while ((nread = nonblock_read(STDIN_FILENO, buffer, 1024)) > 0) {
+      for (ssize_t i = 0; i < nread; i++)
+        process_byte(buffer[i]);
+    }
+  }
+};
+
+
+enum scene_t {
+  scene_none         = 0,
+  scene_number       = 1,
+  scene_banner       = 2,
+  scene_rain         = 3,
+  scene_conway       = 4,
+  scene_mandelbrot   = 5,
+  scene_rain_forever = 6,
+  scene_loop = 99,
+
+  scene_count = 6,
+};
+
 struct buffer {
   int cols, rows;
   std::vector<tcell_t> old_content;
@@ -164,6 +271,7 @@ struct buffer {
   layer_t layers[3];
 
   frame_scheduler scheduler;
+  key_reader kreader;
 
 private:
   void put_utf8(char32_t uc) {
@@ -376,6 +484,15 @@ private:
   byte color_table[11] = {16, 22, 28, 35, 41, 47, 84, 121, 157, 194, 231, };
   //byte color_table[11] = {16, 22, 29, 35, 42, 48, 85, 121, 158, 194, 231, };
 
+  void clear_content() {
+    for (auto& tcell: new_content) {
+      tcell.c = ' ';
+      tcell.fg = color_table[0];
+      tcell.bg = color_table[0];
+      tcell.bold = false;
+    }
+  }
+
   cell_t const* rend_cell(int x, int y, double& power) {
     cell_t const* ret = nullptr;
     for (auto& layer: layers) {
@@ -449,24 +566,41 @@ public:
     this->draw_content();
   }
 
-  bool term_altscreen = false;
+  bool term_internal = false;
   void term_leave() {
-    if (!term_altscreen) return;
-    term_altscreen = false;
-    std::fprintf(file, "\x1b[%dH\n", rows);
+    if (!term_internal) return;
+    term_internal = false;
+    std::fprintf(file, "\x1b[m\x1b[%dH\n", rows);
     std::fprintf(file, "\x1b[?1049l\x1b[?25h");
     std::fflush(file);
+    kreader.leave();
   }
   void term_enter() {
-    if (term_altscreen) return;
-    term_altscreen = true;
+    if (term_internal) return;
+    term_internal = true;
+    kreader.enter();
     std::fprintf(file, "\x1b[?1049h\x1b[?25l");
     sgr0();
     redraw();
     std::fflush(file);
   }
 
+  bool is_menu = false;
+  void process_key(key_t k) {
+    if (is_menu) {
+      menu_process_key(k);
+    } else {
+      switch (k) {
+      case key_ctrl('m'):
+      case key_ctrl('j'):
+        menu_initialize();
+        break;
+      }
+    }
+  }
+
   void initialize() {
+    kreader.proc = [this] (key_t k) { this->process_key(k); };
     struct winsize ws;
     ioctl(STDIN_FILENO, TIOCGWINSZ, (char*) &ws);
     cols = ws.ws_col;
@@ -506,7 +640,15 @@ public:
 public:
   void s3rain(std::uint32_t nloop, double (*scroll_func)(double)) {
     static byte speed_table[] = {2, 2, 2, 2, 3, 3, 6, 6, 6, 7, 7, 8, 8, 8};
+
     double const scr0 = scroll_func(0);
+    int initial_scrollx[3];
+    int initial_scrolly[3];
+    for (int i = 0; i < 3; i++) {
+      initial_scrollx[i] = layers[i].scrollx;
+      initial_scrolly[i] = layers[i].scrolly;
+    }
+
     for (std::uint32_t loop = 0; nloop == 0 || loop < nloop; loop++) {
       // add new threads
       if (now % (1 + 150 / cols) == 0) {
@@ -523,21 +665,25 @@ public:
       }
 
       double const scr = scroll_func(loop) - scr0;
-      layers[0].scrollx = -std::round(500 * scr);
-      layers[1].scrollx = -std::round(50 * scr);
-      layers[2].scrollx = +std::round(200 * scr);
+      layers[0].scrollx = initial_scrollx[0] - std::round(500 * scr);
+      layers[1].scrollx = initial_scrollx[1] - std::round(50 * scr);
+      layers[2].scrollx = initial_scrollx[2] + std::round(200 * scr);
 
-      layers[0].scrolly = -std::round(25 * scr);
-      layers[1].scrolly = +std::round(20 * scr);
-      layers[2].scrolly = +std::round(45 * scr);
+      layers[0].scrolly = initial_scrolly[0] - std::round(25 * scr);
+      layers[1].scrolly = initial_scrolly[1] + std::round(20 * scr);
+      layers[2].scrolly = initial_scrolly[2] + std::round(45 * scr);
 
       render_layers();
       scheduler.next_frame();
+      kreader.process();
+      if (is_menu) return;
     }
     std::uint32_t const wait = 8 * rows + config::default_decay;
     for (std::uint32_t loop = 0; loop < wait; loop++) {
       render_layers();
       scheduler.next_frame();
+      kreader.process();
+      if (is_menu) return;
     }
   }
 
@@ -565,12 +711,15 @@ private:
 
 public:
   void s1number() {
+    clear_content();
     int stripe_periods[] = {0, 32, 16, 8, 4, 2, 2, 2};
     for (int stripe: stripe_periods) {
       for (int i = 0; i < 20; i++) {
         s1number_fill_numbers(stripe);
         render_direct();
         scheduler.next_frame();
+        kreader.process();
+        if (is_menu) return;
       }
     }
   }
@@ -690,6 +839,8 @@ private:
       // Adjust rendering width
       int rest = cols - this->min_width - 4;
       this->render_width = this->min_width;
+      for (glyph_t& g: glyphs)
+        g.render_width = g.w + 1;
       while (rest > 0) {
         int min_progress = glyphs[0].render_width;
         int min_progress_count = 0;
@@ -743,10 +894,6 @@ private:
   };
 
   banner_t banner;
-  void s2banner_initialize(std::vector<std::string> const& messages) {
-    for (std::string const& msg: messages)
-      banner.add_message(msg);
-  }
 
   void s2banner_write_letter(int x0, int y0, glyph_t const& glyph, int type) {
     x0 += (glyph.render_width - 1 - glyph.w) / 2;
@@ -772,10 +919,10 @@ private:
 
   void s2banner_put_char(int x0, int y0, int x, int y, int type, char32_t uchar) {
     if (type == 0) {
-      cell_t& cell = layers[0].cell(x0 + x, y0 + y);
+      cell_t& cell = layers[0].rcell(x0 + x, y0 + y);
       cell.c = ' ';
     } else if (type == 1) {
-      cell_t& cell = layers[0].cell(x0 + x, y0 + y);
+      cell_t& cell = layers[0].rcell(x0 + x, y0 + y);
       cell.c = uchar;
       cell.birth = now;
       cell.power = 1.0;
@@ -802,8 +949,8 @@ private:
       s2banner_put_char(x0, y0, x, y, type, util::rand_char());
   }
 
-  void s2banner_add_thread() {
-    if (now % (1 + 2000 / cols) == 0) {
+  void s2banner_add_thread(int ilayer, int interval) {
+    if (now % (1 + interval / cols) == 0) {
       thread_t thread;
       thread.x = util::rand() % cols;
       thread.y = 0;
@@ -811,7 +958,7 @@ private:
       thread.speed = 8;
       thread.power = 0.5;
       thread.decay = config::default_decay;
-      layers[1].add_thread(thread);
+      layers[ilayer].add_thread(thread);
     }
   }
 
@@ -888,15 +1035,19 @@ private:
         break;
       }
 
-      s2banner_add_thread();
+      s2banner_add_thread(1, 2000);
       render_layers();
       scheduler.next_frame();
+      kreader.process();
+      if (is_menu) return;
     }
   }
 public:
-  void s2banner(std::vector<std::string> const& messages) {
-    s2banner_initialize(messages);
-
+public:
+  void s2banner_add_message(std::string const& message) {
+    banner.add_message(message);
+  }
+  void s2banner() {
     // mode = 0: glyph を使って表示
     // mode = 1: 単純に文字を並べる
     // mode = 2: 1文字ずつ空白を空けて文字を並べる
@@ -955,6 +1106,8 @@ public:
       s4conway_frame(0.5 + loop * 0.01, 0.01 * distance, std::min(0.8, 3.0 / std::sqrt(distance)));
       render_layers();
       scheduler.next_frame();
+      kreader.process();
+      if (is_menu) return;
     }
   }
 
@@ -997,13 +1150,113 @@ public:
       s5mandel_frame(theta, scale, std::min(0.01 * loop, 1.0));
       render_layers();
       scheduler.next_frame();
+      kreader.process();
+      if (is_menu) return;
     }
     for (loop = 0; loop < 100; loop++) {
       render_layers();
       scheduler.next_frame();
+      kreader.process();
+      if (is_menu) return;
     }
 
     twinkle = default_twinkle;
+  }
+
+private:
+  static constexpr int menu_index_min = scene_number;
+  static constexpr int menu_index_max = scene_rain_forever;
+  int menu_index = menu_index_min;
+
+  void menu_initialize() {
+    is_menu = true;
+    menu_index = menu_index_min;
+  }
+
+  void menu_process_key(key_t k) {
+    switch (k) {
+    case key_ctrl('p'):
+    case 'k':
+    case key_up:
+      if (menu_index > menu_index_min)
+        menu_index--;
+      break;
+    case key_ctrl('n'):
+    case 'j':
+    case key_down:
+      if (menu_index < menu_index_max)
+        menu_index++;
+      break;
+    case key_ctrl('m'):
+    case key_ctrl('j'):
+      is_menu = false;
+      break;
+    }
+  }
+  void menu_frame_draw_string(int y0, scene_t scene, const char* name) {
+    std::size_t const len = std::strlen(name);
+    int const progress = 2;
+    int const x0 = (cols - len * progress) / 2;
+    double const power = scene == menu_index ? 1.0 : 0.5;
+    double const flags = scene == menu_index ? 0 : cflag_disable_bold;
+    for (std::size_t i = 0; i < len; i++) {
+      cell_t& cell = layers[0].rcell(x0 + i * progress, y0);
+      cell.c = std::toupper(name[i]);
+      cell.birth = now;
+      cell.power = power;
+      cell.decay = 20;
+      cell.flags = flags;
+    }
+  }
+public:
+  int show_menu() {
+    while (is_menu) {
+      int const line_height = std::min(3, rows / scene_count);
+      int const y0 = (rows - scene_count * line_height) / 2;
+      int i = 0;
+      menu_frame_draw_string(y0 + i++ * line_height, scene_number      , "Number falls");
+      menu_frame_draw_string(y0 + i++ * line_height, scene_banner      , "Banner");
+      menu_frame_draw_string(y0 + i++ * line_height, scene_rain        , "Matrix rain");
+      menu_frame_draw_string(y0 + i++ * line_height, scene_conway      , "Conway's Game of Life");
+      menu_frame_draw_string(y0 + i++ * line_height, scene_mandelbrot  , "Mandelbrot set");
+      menu_frame_draw_string(y0 + i++ * line_height, scene_rain_forever, "Rain forever");
+
+      s2banner_add_thread(1, 5000);
+      render_layers();
+      scheduler.next_frame();
+      kreader.process();
+      if (!is_menu) break;
+    }
+
+    return menu_index;
+  }
+
+public:
+  void scene(scene_t s) {
+    switch (s) {
+    case scene_none:
+      break;
+    case scene_number:
+      this->s1number();
+      break;
+    case scene_banner:
+      this->s2banner();
+      break;
+    case scene_rain:
+      this->s3rain(2800, buffer::s3rain_scroll_func_tanh);
+      break;
+    case scene_conway:
+      this->s4conway();
+      break;
+    case scene_mandelbrot:
+      this->s5mandel();
+      break;
+    case scene_rain_forever:
+      this->s3rain(0, buffer::s3rain_scroll_func_const);
+      break;
+    case scene_loop:
+      break;
+    }
   }
 };
 
@@ -1033,7 +1286,198 @@ void trapcont(int) {
 
 using namespace cxxmatrix;
 
+struct arguments {
+  bool flag_error = false;
+  bool flag_help = false;
+
+public:
+  void print_help(std::FILE* file) {
+    std::fprintf(file,
+      "cxxmatrix (C++ Matrix)\n"
+      "usage: cxxmatrix [OPTIONS...] [[--] MESSAGE...]\n"
+      "\n"
+      "MESSAGE\n"
+      "   Add a message for 'banner' scene.  When no messages are specified a message\n"
+      "   \"C++ MATRIX\" will be used.\n"
+      "\n"
+      //------------------------------------------------------------------------------
+      "OPTIONS\n"
+      "   --help      Show help\n"
+      "   --          The rest arguments are processed as MESSAGE\n"
+      "   -m, --message=MESSAGE\n"
+      "               Add a message for 'banner' scene.\n"
+      "   -s, --scene=SCENE\n"
+      "               Add scenes. Comma separated list of 'number', 'banner', 'rain',\n"
+      "               'conway', 'mandelbrot', 'rain-forever' and 'loop'.\n"
+      "\n"
+      "Keyboard\n"
+      "   C-c (SIGINT)  Quit\n"
+      "   C-z (SIGTSTP) Suspend\n"
+      "   C-m, RET      Show menu\n"
+      "\n"
+    );
+  }
+private:
+  int argc;
+  char** argv;
+  int iarg;
+  char const* arg;
+  char const* get_optarg(char c) {
+    if (*arg) {
+      char const* ret = arg;
+      arg = "";
+      return ret;
+    } else if (iarg < argc) {
+      return argv[iarg++];
+    } else {
+      std::fprintf(stderr, "cxxmatrix: missing option argument for '-%c'.", c);
+      flag_error = true;
+      return nullptr;
+    }
+  }
+
+  char const* longopt_arg;
+  bool is_longopt(const char* name) {
+    const char* p = arg;
+    while (*name && *name == *p) p++, name++;
+    if (*name) return false;
+    if (*p == '=') {
+      longopt_arg = p + 1;
+      return true;
+    } else if (*p == '\0') {
+      longopt_arg = nullptr;
+      return true;
+    } else {
+      return false;
+    }
+  }
+  char const* get_longoptarg() {
+    if (longopt_arg) {
+      return longopt_arg;
+    } else if (iarg < argc) {
+      return argv[iarg++];
+    } else {
+      std::fprintf(stderr, "cxxmatrix: missing option argument for \"--%s\"\n", arg);
+      flag_error = true;
+      return nullptr;
+    }
+  }
+
+public:
+  std::vector<std::string> messages;
+private:
+  void push_message(const char* message) {
+    messages.push_back(message);
+  }
+
+public:
+  std::vector<scene_t> scenes;
+private:
+  void push_scene(const char* scene) {
+    std::vector<std::string_view> names = util::split(scene, ',');
+    for (auto const& name: names) {
+      if (name == "number") {
+        scenes.push_back(scene_number);
+      } else if (name == "banner") {
+        scenes.push_back(scene_banner);
+      } else if (name == "conway") {
+        scenes.push_back(scene_conway);
+      } else if (name == "rain") {
+        scenes.push_back(scene_rain);
+      } else if (name == "mandelbrot") {
+        scenes.push_back(scene_mandelbrot);
+      } else if (name == "loop") {
+        if (scenes.empty()) {
+          std::fprintf(stderr, "cxxmatrix: nothing to loop (-s loop)\n");
+          flag_error = true;
+          return;
+        }
+        scenes.push_back(scene_loop);
+      } else if (name == "rain-forever") {
+        scenes.push_back(scene_rain_forever);
+      } else {
+        std::fprintf(stderr, "cxxxmatrix: unknown value for scene (%.*s)\n", (int) name.size(), name.data());
+        flag_error = true;
+      }
+    }
+  }
+
+public:
+  bool process(int argc, char** argv) {
+    bool flag_literal = false;
+    this->argc = argc;
+    this->argv = argv;
+    this->iarg = 1;
+    while (iarg < argc) {
+      arg = argv[iarg++];
+      if (!flag_literal && arg[0] == '-') {
+        if (arg[1] == '-') {
+          arg += 2;
+          if (!*arg) {
+            flag_literal = true;
+          } else if (is_longopt("help")) {
+            flag_help = true;
+          } else if (is_longopt("message")) {
+            push_message(get_longoptarg());
+          } else if (is_longopt("scene")) {
+            push_scene(get_longoptarg());
+          } else {
+            std::fprintf(stderr, "cxxmatrix: unknown long option (--%s)\n", arg);
+            flag_error = true;
+          }
+        } else {
+          arg++;
+          while (char const c = *arg++) {
+            switch (c) {
+            case 'm':
+              if (char const* opt = get_optarg(c))
+                push_message(opt);
+              break;
+            case 's':
+              if (char const* opt = get_optarg(c))
+                push_scene(opt);
+              break;
+            default:
+              std::fprintf(stderr, "cxxmatrix: unknown option (-%c)\n", c);
+              flag_error = true;
+              break;
+            }
+          }
+        }
+        continue;
+      }
+      push_message(arg);
+    }
+    return !flag_error;
+  }
+  arguments(int argc, char** argv) {
+    this->process(argc, argv);
+  }
+};
+
 int main(int argc, char** argv) {
+  arguments args(argc, argv);
+  if (args.flag_error) return 2;
+  if (args.flag_help) {
+    args.print_help(stdout);
+    return 0;
+  }
+
+  if (args.scenes.empty()) {
+    args.scenes.push_back(scene_number);
+    args.scenes.push_back(scene_banner);
+    args.scenes.push_back(scene_rain);
+    args.scenes.push_back(scene_conway);
+    args.scenes.push_back(scene_mandelbrot);
+    args.scenes.push_back(scene_rain_forever);
+  }
+  if (args.messages.size()) {
+    for (std::string const& msg: args.messages)
+      buff.s2banner_add_message(msg);
+  } else {
+    buff.s2banner_add_message("C++ Matrix");
+  }
+
   std::signal(SIGINT, trapint);
   std::signal(SIGWINCH, trapwinch);
   std::signal(SIGTSTP, traptstp);
@@ -1041,19 +1485,27 @@ int main(int argc, char** argv) {
 
   buff.initialize();
   buff.term_enter();
+  std::size_t index = 0;
+  while (index < args.scenes.size()) {
+    scene_t const scene = args.scenes[index++];
+    switch (scene) {
+    case scene_none: break;
+    case scene_loop: index = 0; break;
+    default:
+      buff.scene(scene);
+      break;
+    }
 
-  std::vector<std::string> messages;
-  for (int i = 1; i < argc; i++)
-    messages.push_back(argv[i]);
+    if (buff.is_menu) break;
+  }
 
-  buff.s1number();
-  buff.s2banner(messages);
-  buff.s3rain(2800, buffer::s3rain_scroll_func_tanh);
-  buff.s4conway();
-  buff.s5mandel();
-
-  // Infinite rain
-  buff.s3rain(0, buffer::s3rain_scroll_func_const);
+  if (buff.is_menu) {
+    for (;;) {
+      buff.is_menu = true;
+      scene_t const scene = (scene_t) buff.show_menu();
+      buff.scene(scene);
+    }
+  }
 
   buff.finalize();
   return 0;
