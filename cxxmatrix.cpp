@@ -26,7 +26,7 @@
 #include "conway.hpp"
 
 namespace cxxmatrix::config {
-  constexpr std::chrono::milliseconds frame_interval {40};
+  constexpr std::chrono::milliseconds default_frame_interval {40};
   constexpr int default_decay = 100; // 既定の寿命
 }
 
@@ -35,11 +35,13 @@ namespace cxxmatrix {
 struct frame_scheduler {
   using clock_type = std::chrono::high_resolution_clock;
   clock_type::time_point prev;
+  std::chrono::milliseconds frame_interval;
   frame_scheduler() {
+    frame_interval = config::default_frame_interval;
     prev = clock_type::now();
   }
   void next_frame() {
-    clock_type::time_point until = prev + config::frame_interval;
+    clock_type::time_point until = prev + frame_interval;
     clock_type::time_point now = clock_type::now();
     if (until > now)
       std::this_thread::sleep_for(until - now);
@@ -83,6 +85,13 @@ struct layer_t {
   int scrollx, scrolly;
   std::vector<cell_t> content;
   std::vector<thread_t> threads;
+
+private:
+  int error_rate_modulo = 20;
+public:
+  void set_error_rate(double value) {
+    error_rate_modulo = value > 0.0 ? std::ceil(20 / value) : 0;
+  }
 
 public:
   void resize(int cols, int rows) {
@@ -152,7 +161,7 @@ public:
         }
 
         cell.current_power = cell.power * cell.stage;
-        if (util::rand() % 20 == 0)
+        if (error_rate_modulo && util::rand() % error_rate_modulo == 0)
           cell.c = util::rand_char();
       }
     }
@@ -264,12 +273,39 @@ enum scene_t {
 };
 
 struct buffer {
+private:
+  bool setting_diffuse_enabled = true;
+  bool setting_twinkle_enabled = true;
+  bool setting_preserve_background = false;
+  double setting_rain_interval = 150;
+public:
+  void set_diffuse_enabled(bool value) {
+    this->setting_diffuse_enabled = value;
+  }
+  void set_twinkle_enabled(bool value) {
+    this->setting_twinkle_enabled = value;
+    this->update_twinkle_rendering();
+  }
+  void set_preserve_background(bool value) {
+    this->setting_preserve_background = value;
+  }
+  void set_rain_density(double value) {
+    setting_rain_interval = 150 / value;
+  }
+
+private:
+  layer_t layers[3];
+public:
+  void set_error_rate(double value) {
+    for (auto& layer : layers)
+      layer.set_error_rate(value);
+  }
+
+private:
   int cols, rows;
   std::vector<tcell_t> old_content;
   std::vector<tcell_t> new_content;
   std::FILE* file;
-
-  layer_t layers[3];
 
 private:
   bool flag_sigwinch = false;
@@ -291,10 +327,17 @@ private:
     process_signals();
     scheduler.next_frame();
   }
+public:
+  void set_frame_rate(double frame_rate) {
+    using msec_rep = std::chrono::milliseconds::rep;
+    constexpr msec_rep max_frame_interval = 1000 * 3600;
+
+    double const frame_interval = 1000 / frame_rate;
+    scheduler.frame_interval = std::chrono::milliseconds((msec_rep) std::clamp(frame_interval, 1.0, (double) max_frame_interval));
+  }
 
 public:
   key_reader kreader;
-
 
 public:
   buffer() {
@@ -334,7 +377,10 @@ private:
   void set_color(tcell_t const& tcell) {
     if (tcell.bg != this->bg) {
       this->bg = tcell.bg;
-      std::fprintf(file, "\x1b[48;5;%dm", this->bg);
+      if (setting_preserve_background && this->bg == color_table[0])
+        std::fprintf(file, "\x1b[49m");
+      else
+        std::fprintf(file, "\x1b[48;5;%dm", this->bg);
     }
     if (tcell.c != ' ') {
       if (tcell.fg != fg) {
@@ -403,7 +449,6 @@ private:
   }
 
 private:
-
   static bool is_changed(tcell_t const& ncell, tcell_t const& ocell) {
     if (ncell.c != ocell.c || ncell.bg != ocell.bg) return true;
     if (ncell.c == ' ') return false;
@@ -413,6 +458,7 @@ private:
   bool term_draw_cell(int x, int y, std::size_t index, bool force_write) {
     tcell_t& ncell = new_content[index];
     tcell_t& ocell = old_content[index];
+    if (ncell.fg == ocell.bg) ncell.c = ' ';
     if (force_write || is_changed(ncell, ocell)) {
       goto_xy(x, y);
       set_color(ncell);
@@ -505,9 +551,21 @@ private:
   }
 
 public:
-  static constexpr double default_twinkle = 0.2;
   int now = 100;
-  double twinkle = default_twinkle;
+
+private:
+  static constexpr double default_twinkle = 0.2;
+  double m_twinkle = default_twinkle;
+  double m_twinkle_rendering = m_twinkle;
+  void update_twinkle_rendering() {
+    if (setting_twinkle_enabled)
+      m_twinkle_rendering = m_twinkle;
+    else
+      m_twinkle_rendering = 0.0;
+  }
+  void set_twinkle(double value) {
+    this->m_twinkle = value;
+  }
 
 private:
   std::vector<byte> color_table;
@@ -601,19 +659,21 @@ private:
         tcell.c = lcell->c;
 
         // current_power = 現在の輝度 (瞬き)
-        if (twinkle != 0.0) {
-          current_power -= std::hypot(current_power * twinkle, 0.1) * util::randf();
+        if (m_twinkle_rendering != 0.0) {
+          current_power -= std::hypot(current_power * m_twinkle_rendering, 0.1) * util::randf();
           if (current_power < 0.0) current_power = 0.0;
         }
 
         // level = 色番号
         double const fractional_level = util::interpolate(current_power, 0.6, color_table.size());
         int level = fractional_level;
-        if (twinkle != 0.0 && util::randf() > fractional_level - level) level++;
+        if (m_twinkle_rendering != 0.0 && util::randf() > fractional_level - level) level++;
         level = std::min<int>(level, color_table.size() - 1);
 
         tcell.fg = color_table[level];
         tcell.bold = !(lcell->flags & cflag_disable_bold) && lcell->stage > 0.5;
+
+        if (!setting_diffuse_enabled) continue;
 
         double const twinkle_power = (double) level / (color_table.size() - 1);
         double const p0 = ((1.0 / 0.3) * (twinkle_power - 0.0));
@@ -632,7 +692,8 @@ private:
       }
     }
 
-    resolve_diffuse();
+    if (setting_diffuse_enabled)
+      resolve_diffuse();
   }
 
 public:
@@ -735,7 +796,7 @@ public:
 
     for (std::uint32_t loop = 0; nloop == 0 || loop < nloop; loop++) {
       // add new threads
-      if (now % (1 + 150 / cols) == 0) {
+      if (now % (int) std::ceil(setting_rain_interval / cols) == 0) {
         thread_t thread;
         thread.x = util::rand() % cols;
         thread.y = 0;
@@ -1219,7 +1280,7 @@ private:
 
 public:
   void s5mandel() {
-    twinkle = 0.1;
+    set_twinkle(0.1);
 
     double const scale0 = 1e-17, scaleN = 30.0 / std::min(cols, rows);
     std::uint32_t const nloop = 3000;
@@ -1244,7 +1305,7 @@ public:
       if (is_menu) return;
     }
 
-    twinkle = default_twinkle;
+    set_twinkle(default_twinkle);
   }
 
 private:
@@ -1385,8 +1446,8 @@ public:
       "\n"
       //------------------------------------------------------------------------------
       "OPTIONS\n"
-      "   --help      Show help\n"
-      "   --          The rest arguments are processed as MESSAGE\n"
+      "   --help      Show help.\n"
+      "   --          The rest arguments are processed as MESSAGE.\n"
       "   -m, --message=MESSAGE\n"
       "               Add a message for 'banner' scene.\n"
       "   -s, --scene=SCENE\n"
@@ -1396,6 +1457,24 @@ public:
       "               Set color. One of 'default', 'black', 'red', 'green', 'yellow',\n"
       "               'blue', 'magenta', 'cyan', 'white', and integer 0-255 (256 index\n"
       "               color).\n"
+      "   --frame-rate=NUM\n"
+      "               Set the frame rate per second.  A positive number less than or\n"
+      "               equal to 1000.  The default is 25.\n"
+      "   --error-rate=NUM\n"
+      "               Set the factor for the rate of character changes.  A\n"
+      "               non-negative number.  The default is 1.0.\n"
+      "   --diffuse\n"
+      "   --no-diffuse\n"
+      "               Turn on/off the background-color effect.  Turned on by default.\n"
+      "   --twinkle\n"
+      "   --no-twinkle\n"
+      "               Turn on/off the twinkling effect.  Turned on by default.\n"
+      "   --preserve-background\n"
+      "   --no-preserve-background\n"
+      "               Preserve terminal background or not.  Not preserve by default.\n"
+      "   --rain-density=NUM\n"
+      "               Set the factor for the density of rain drops.  A positive\n"
+      "               number.  The default is 1.0.\n"
       "\n"
       "Keyboard\n"
       "   C-c (SIGINT)  Quit\n"
@@ -1534,6 +1613,51 @@ private:
   }
 
 public:
+  bool flag_diffuse_enabled = true;
+  bool flag_twinkle_enabled = true;
+  bool flag_preserve_background = false;
+  double frame_rate = 25;
+  double error_rate = 1.0;
+  double rain_density = 1.0;
+private:
+  void set_frame_rate(const char* frame_rate_text) {
+    if (std::isdigit(frame_rate_text[0])) {
+      double const value = std::atof(frame_rate_text);
+      if (0.0 < value && value <= 1000.0) {
+        this->frame_rate = value;
+        return;
+      }
+    }
+
+    std::fprintf(stderr, "cxxmatrix: the frame rate (%s) needs to be a positive number <= 1000.0.\n", frame_rate_text);
+    flag_error = true;
+  }
+  void set_error_rate(const char* error_rate_text) {
+    if (std::isdigit(error_rate_text[0])) {
+      double const value = std::atof(error_rate_text);
+      if (0.0 <= value) {
+        this->error_rate = value;
+        return;
+      }
+    }
+
+    std::fprintf(stderr, "cxxmatrix: the error rate (%s) needs to be a non-negative number.\n", error_rate_text);
+    flag_error = true;
+  }
+  void set_rain_density(const char* rain_density_text) {
+    if (std::isdigit(rain_density_text[0])) {
+      double const value = std::atof(rain_density_text);
+      if (0.0 < value) {
+        this->rain_density = value;
+        return;
+      }
+    }
+
+    std::fprintf(stderr, "cxxmatrix: the rain density (%s) needs to be a positive number.\n", rain_density_text);
+    flag_error = true;
+  }
+
+public:
   bool process(int argc, char** argv) {
     bool flag_literal = false;
     this->argc = argc;
@@ -1548,12 +1672,30 @@ public:
             flag_literal = true;
           } else if (is_longopt("help")) {
             flag_help = true;
+          } else if (is_longopt("diffuse")) {
+            flag_diffuse_enabled = true;
+          } else if (is_longopt("no-diffuse")) {
+            flag_diffuse_enabled = false;
+          } else if (is_longopt("twinkle")) {
+            flag_twinkle_enabled = true;
+          } else if (is_longopt("no-twinkle")) {
+            flag_twinkle_enabled = false;
+          } else if (is_longopt("preserve-background")) {
+            flag_preserve_background = true;
+          } else if (is_longopt("no-preserve-background")) {
+            flag_preserve_background = false;
           } else if (is_longopt("message")) {
             push_message(get_longoptarg());
           } else if (is_longopt("scene")) {
             push_scene(get_longoptarg());
           } else if (is_longopt("color")) {
             set_color(get_longoptarg());
+          } else if (is_longopt("frame-rate")) {
+            set_frame_rate(get_longoptarg());
+          } else if (is_longopt("error-rate")) {
+            set_error_rate(get_longoptarg());
+          } else if (is_longopt("rain-density")) {
+            set_rain_density(get_longoptarg());
           } else {
             std::fprintf(stderr, "cxxmatrix: unknown long option (--%s)\n", arg);
             flag_error = true;
@@ -1615,6 +1757,12 @@ int main(int argc, char** argv) {
     buff.s2banner_add_message("C++ Matrix");
   }
   buff.initialize_color_table(args.color);
+  buff.set_frame_rate(args.frame_rate);
+  buff.set_error_rate(args.error_rate);
+  buff.set_diffuse_enabled(args.flag_diffuse_enabled);
+  buff.set_twinkle_enabled(args.flag_twinkle_enabled);
+  buff.set_preserve_background(args.flag_preserve_background);
+  buff.set_rain_density(args.rain_density);
 
   std::signal(SIGINT, trapint);
   std::signal(SIGWINCH, trapwinch);
