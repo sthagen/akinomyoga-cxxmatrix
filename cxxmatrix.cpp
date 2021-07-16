@@ -57,10 +57,9 @@ struct tcell_t {
   double diffuse = 0;
 };
 
-enum cell_flags
-  {
-   cflag_disable_bold = 0x1,
-  };
+enum cell_flags {
+  cflag_disable_bold = 0x1,
+};
 
 struct cell_t {
   char32_t c = U' ';
@@ -267,9 +266,10 @@ enum scene_t {
   scene_conway       = 4,
   scene_mandelbrot   = 5,
   scene_rain_forever = 6,
+  scene_exit         = 7, // Exit (menu)
   scene_loop = 99,
 
-  scene_count = 6,
+  scene_count = 7,
 };
 
 struct buffer {
@@ -308,14 +308,14 @@ private:
   std::FILE* file;
 
 private:
-  bool flag_sigwinch = false;
+  bool flag_resize = false;
 public:
-  void set_sigwinch() {
-    flag_sigwinch = true;
+  void notify_resize() {
+    flag_resize = true;
   }
   void process_signals() {
-    if (flag_sigwinch) {
-      flag_sigwinch = false;
+    if (flag_resize) {
+      flag_resize = false;
       initialize();
       redraw();
     }
@@ -715,6 +715,7 @@ public:
   void term_leave() {
     if (!term_internal) return;
     term_internal = false;
+    std::fprintf(file, "\x18"); // CAN
     std::fprintf(file, "\x1b[m\x1b[%dH\n", rows);
     std::fprintf(file, "\x1b[?1049l\x1b[?25h");
     std::fflush(file);
@@ -1310,7 +1311,7 @@ public:
 
 private:
   static constexpr int menu_index_min = scene_number;
-  static constexpr int menu_index_max = scene_rain_forever;
+  static constexpr int menu_index_max = scene_exit;
   int menu_index = menu_index_min;
 
   void menu_initialize() {
@@ -1356,7 +1357,7 @@ private:
 public:
   int show_menu() {
     while (is_menu) {
-      int const line_height = std::min(3, rows / scene_count);
+      int const line_height = std::clamp(rows / scene_count, 1, 3);
       int const y0 = (rows - scene_count * line_height) / 2;
       int i = 0;
       menu_frame_draw_string(y0 + i++ * line_height, scene_number      , "Number falls");
@@ -1365,6 +1366,7 @@ public:
       menu_frame_draw_string(y0 + i++ * line_height, scene_conway      , "Conway's Game of Life");
       menu_frame_draw_string(y0 + i++ * line_height, scene_mandelbrot  , "Mandelbrot set");
       menu_frame_draw_string(y0 + i++ * line_height, scene_rain_forever, "Rain forever");
+      menu_frame_draw_string(y0 + i++ * line_height, scene_exit        , "Exit");
 
       s2banner_add_thread(1, 5000);
       render_layers();
@@ -1399,6 +1401,9 @@ public:
     case scene_rain_forever:
       this->s3rain(0, buffer::s3rain_scroll_func_const);
       break;
+    case scene_exit:
+      this->finalize();
+      std::exit(0);
     case scene_loop:
       break;
     }
@@ -1414,7 +1419,7 @@ void trapint(int sig) {
   std::exit(128 + sig);
 }
 void trapwinch(int) {
-  buff.set_sigwinch();
+  buff.notify_resize();
 }
 void traptstp(int sig) {
   buff.term_leave();
@@ -1423,6 +1428,7 @@ void traptstp(int sig) {
 }
 void trapcont(int) {
   buff.term_enter();
+  buff.notify_resize();
   std::signal(SIGTSTP, traptstp);
 }
 
