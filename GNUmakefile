@@ -26,13 +26,43 @@ endif
 CPPFLAGS = -MD -MP -MF $(@:.o=.dep)
 CXXFLAGS := -std=c++17 -Wall -Wextra -Ofast
 
+# @var DESTDIR
+# @var PREFIX [/usr/local]
+# @var INSTALL_SUBDIR_LICENSE [share/licenses]
+#
+# These variables control the install location used by "make
+# install". Files are copied to the following directories:
+#
+# - DESTDIR/PREFIX/bin
+# - DESTDIR/PREFIX/share/cxxmatrix
+# - DESTDIR/PREFIX/INSTALL_SUBDIR_LICENSE/cxxmatrix
+#
+ifneq ($(filter-out %/,$(DESTDIR)),)
+  DESTDIR := $(DESTDIR)/
+endif
+ifneq ($(DESTDIR)$(PREFIX),)
+  insdir_base := $(DESTDIR)$(PREFIX)
+else
+  insdir_base := /usr/local
+endif
+INSTALL_SUBDIR_LICENSE := share/licenses/cxxmatrix
+insdir_license := $(insdir_base)/$(INSTALL_SUBDIR_LICENSE)
+
 #------------------------------------------------------------------------------
 # cxx matrix
 
 all: cxxmatrix
 
+cxxmatrix-OBJS := cxxmatrix.o
+ifeq ($(TARGET),win32)
+  cxxmatrix-OBJS += term_win32.o
+  CXXFLAGS += -s -static -static-libgcc -static-libstdc++
+else
+  cxxmatrix-OBJS += term_unix.o
+endif
+
 -include $(wildcard *.dep)
-cxxmatrix: cxxmatrix.o
+cxxmatrix: $(cxxmatrix-OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 cxxmatrix.o: cxxmatrix.cpp glyph.inl
@@ -45,16 +75,14 @@ glyph.inl: glyph.awk glyph.def
 clean:
 	-rm -rf *.o glyph.inl
 
-ifeq ("$(PREFIX)","")
-  PREFIX := /usr/local
-endif
+
 install: cxxmatrix
-	mkdir -p "$(PREFIX)/bin"
-	cp cxxmatrix "$(PREFIX)/bin/cxxmatrix"
-	chmod +x "$(PREFIX)/bin/cxxmatrix"
-	mkdir -p "$(PREFIX)/share/man/man1"
-	gzip -c cxxmatrix.1 > "$(PREFIX)/share/man/man1/cxxmatrix.1.gz"
-	mkdir -p "$(PREFIX)/share/licenses/cxxmatrix"
-	cp LICENSE.md "$(PREFIX)/share/licenses/cxxmatrix/LICENSE.md"
+	mkdir -p "$(insdir_base)/bin"
+	cp cxxmatrix "$(insdir_base)/bin/cxxmatrix"
+	chmod +x "$(insdir_base)/bin/cxxmatrix"
+	mkdir -p "$(insdir_base)/share/man/man1"
+	gzip -c cxxmatrix.1 > "$(insdir_base)/share/man/man1/cxxmatrix.1.gz"
+	mkdir -p "$(insdir_license)"
+	cp LICENSE.md "$(insdir_license)/LICENSE.md"
 
 #------------------------------------------------------------------------------
