@@ -314,6 +314,8 @@ private:
   bool setting_twinkle_enabled = true;
   bool setting_preserve_background = false;
   double setting_rain_interval = 150;
+
+  bool setting_term_synchronized_update = false;
 public:
   void set_diffuse_enabled(bool value) {
     this->setting_diffuse_enabled = value;
@@ -326,7 +328,10 @@ public:
     this->setting_preserve_background = value;
   }
   void set_rain_density(double value) {
-    setting_rain_interval = 150 / value;
+    this->setting_rain_interval = 150 / value;
+  }
+  void set_term_synchronized_update(bool value) {
+    this->setting_term_synchronized_update = value;
   }
 
 private:
@@ -546,6 +551,8 @@ public:
   }
 
   void draw_content() {
+    if (setting_term_synchronized_update)
+      std::fprintf(file, "\x1b[?2026h");
     for (int y = 0; y < rows; y++) {
       for (int x = 0; x < cols - 1; x++) {
         std::size_t const index = y * cols + x;
@@ -562,6 +569,8 @@ public:
         term_draw_cell(x, y, index, dirty);
       }
     }
+    if (setting_term_synchronized_update)
+      std::fprintf(file, "\x1b[?2026l");
     std::fflush(file);
     process_signals();
   }
@@ -1744,10 +1753,14 @@ public:
       "               Turn on/off the twinkling effect.  Turned on by default.\n"
       "   --preserve-background\n"
       "   --no-preserve-background\n"
-      "               Preserve terminal background or not.  Not preserve by default.\n"
+      "               Preserve terminal background or not.  Not preserved by default.\n"
       "   --rain-density=NUM\n"
       "               Set the factor for the density of rain drops.  A positive\n"
       "               number.  The default is 1.0.\n"
+      "   --synchronized-update\n"
+      "   --no-synchronized-update\n"
+      "               Use the terminal's feature Synchronized Update, DECSET(2026), or\n"
+      "               not.  Not used by default.\n"
       "\n"
       "Keyboard\n"
       "   C-c (SIGINT), q, Q  Quit\n"
@@ -1955,6 +1968,7 @@ public:
   bool flag_diffuse_enabled = true;
   bool flag_twinkle_enabled = true;
   bool flag_preserve_background = false;
+  bool flag_synchronized_update = false;
   double frame_rate = 25;
   double error_rate = 1.0;
   double rain_density = 1.0;
@@ -2023,6 +2037,10 @@ public:
             flag_preserve_background = true;
           } else if (is_longopt("no-preserve-background")) {
             flag_preserve_background = false;
+          } else if (is_longopt("synchronized-update")) {
+            flag_synchronized_update = true;
+          } else if (is_longopt("no-synchronized-update")) {
+            flag_synchronized_update = false;
           } else if (is_longopt("message")) {
             push_message(get_longoptarg());
           } else if (is_longopt("scene")) {
@@ -2104,6 +2122,7 @@ int main(int argc, char** argv) {
   buff.set_twinkle_enabled(args.flag_twinkle_enabled);
   buff.set_preserve_background(args.flag_preserve_background);
   buff.set_rain_density(args.rain_density);
+  buff.set_term_synchronized_update(args.flag_synchronized_update);
 
   std::signal(SIGINT, trapint);
   term_init();
