@@ -508,7 +508,7 @@ private:
   bool term_draw_cell(int x, int y, std::size_t index, bool force_write) {
     tcell_t& ncell = new_content[index];
     tcell_t& ocell = old_content[index];
-    if (ncell.fg == ocell.bg) ncell.c = ' ';
+    if (ncell.fg == ncell.bg) ncell.c = ' ';
     if (force_write || is_changed(ncell, ocell)) {
       goto_xy(x, y);
       set_color(ncell);
@@ -557,7 +557,7 @@ public:
       for (int x = 0; x < cols - 1; x++) {
         std::size_t const index = y * cols + x;
 
-        bool dirty = true;
+        bool dirty = false;
 
         // 行末 xenl 対策
         if (x == cols - 2 && term_draw_cell(x, y, index + 1, false)) {
